@@ -889,6 +889,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 )
 
     if _table_exists(conn, "task_runs"):
+        # Forward-and-additive migration for the per-claim capability token
+        # digest (see kb.CLAIM_TOKEN_ENV / kb._assert_worker_env_claim).
+        # Legacy boards get NULL — those runs have no token to match, so a
+        # worker presenting env identity is refused until the task is
+        # redispatched with a fresh (token-carrying) claim.
+        _add_column_if_missing(conn, "task_runs", "claim_token_hash", "claim_token_hash TEXT")
         _backfill_legacy_inflight_runs(conn)
 
     # One-shot event-kind rename: old names still worked but were awkward on
@@ -991,7 +997,7 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT)",
+        " error TEXT, claim_token_hash TEXT)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",
@@ -1143,6 +1149,7 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     since those side effects would fire while the outer txn can still roll back.
     """
     _kb._assert_not_delegated_child_mutation()
+    _kb._assert_worker_env_claim(conn)
     if getattr(conn, "in_transaction", False):
         if not allow_nested:
             raise RuntimeError(

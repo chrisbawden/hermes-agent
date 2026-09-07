@@ -34,10 +34,15 @@ def worker_env(monkeypatch, tmp_path):
     conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
-        kb.claim_task(conn, tid)
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    # Faithful dispatcher export: run id + per-claim capability token (the
+    # write_txn identity gate refuses worker-env mutations without them).
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    monkeypatch.setenv(kb.CLAIM_TOKEN_ENV, claimed.claim_token)
     return tid
 
 

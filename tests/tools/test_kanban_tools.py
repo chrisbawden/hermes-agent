@@ -63,10 +63,15 @@ def worker_env(monkeypatch, tmp_path):
     conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
-        kb.claim_task(conn, tid)
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    # Faithful dispatcher export: run id + per-claim capability token (the
+    # write_txn identity gate refuses worker-env mutations without them).
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    monkeypatch.setenv(kb.CLAIM_TOKEN_ENV, claimed.claim_token)
     return tid
 
 
@@ -83,7 +88,14 @@ def test_show_defaults_to_env_task_id(worker_env):
 
 def test_list_filters_tasks(monkeypatch, worker_env):
     """kanban_list gives orchestrators filtered board discovery."""
-    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    # Orchestrator mode = NO dispatcher worker identity at all (the dispatcher
+    # exports TASK/RUN_ID/CLAIM_LOCK/CLAIM_TOKEN as one set; a partial set is
+    # a stripped lineage, which the write_txn identity gate refuses).
+    from hermes_cli import kanban_db as _kb
+
+    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID",
+                "HERMES_KANBAN_CLAIM_LOCK", _kb.CLAIM_TOKEN_ENV):
+        monkeypatch.delenv(var, raising=False)
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     conn = kbc.connect()
@@ -445,7 +457,11 @@ def test_link_happy_path(worker_env):
 
 
 def test_unblock_happy_path(monkeypatch, worker_env):
-    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as _kb
+
+    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID",
+                "HERMES_KANBAN_CLAIM_LOCK", _kb.CLAIM_TOKEN_ENV):
+        monkeypatch.delenv(var, raising=False)
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     conn = kbc.connect()
@@ -961,6 +977,15 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "channel-1")
+    # Fresh home = fresh DB; the worker_env identity (task/run/token) points at
+    # the old home's DB, and a partial mismatch is exactly what the write_txn
+    # identity gate refuses. This test simulates a chat session, not the
+    # worker, so drop the dispatcher identity entirely.
+    from hermes_cli import kanban_db as _kb
+
+    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID",
+                "HERMES_KANBAN_CLAIM_LOCK", _kb.CLAIM_TOKEN_ENV):
+        monkeypatch.delenv(var, raising=False)
 
     from tools import kanban_tools as kt
     out = kt._handle_create({

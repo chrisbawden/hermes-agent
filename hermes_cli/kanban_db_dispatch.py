@@ -2225,6 +2225,11 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
+    # Per-claim capability token (raw). Only this spawn path receives it: the
+    # delegate_task scrubber strips it from any child the worker spawns, so a
+    # grandchild cannot present it. Never logged, never persisted raw.
+    if getattr(task, "claim_token", None):
+        env[_kb.CLAIM_TOKEN_ENV] = task.claim_token
     # Goal-loop mode (Ralph-style /goal judge loop in cli.py quiet-mode path).
     # Only set when enabled so non-goal tasks keep a clean env.
     if task.goal_mode:

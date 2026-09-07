@@ -41,6 +41,7 @@ For Hermes profile lanes, the dispatcher's `_default_spawn` runs `hermes -p <ass
 | `HERMES_KANBAN_WORKSPACE` | absolute path to *this* task's workspace |
 | `HERMES_KANBAN_RUN_ID` | the current run's id (for the lifecycle gate) |
 | `HERMES_KANBAN_CLAIM_LOCK` | the claim lock string (`<host>:<pid>:<uuid>`) |
+| `HERMES_KANBAN_CLAIM_TOKEN` | per-claim capability token (raw). Authorises the worker's board mutations: any process presenting worker identity env must present the token matching the run's stored SHA-256 digest, or every mutation is refused. Never inherited by `delegate_task` children or any other spawned subprocess (Tier-1 strip). |
 | `HERMES_PROFILE` | the worker's own profile name (for `kanban_comment` author attribution) |
 | `HERMES_TENANT` | tenant namespace, if the task has one |
 
