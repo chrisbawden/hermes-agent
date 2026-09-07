@@ -210,4 +210,10 @@ _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
     "HASS_TOKEN", "EMAIL_PASSWORD", "HERMES_DASHBOARD_SESSION_TOKEN",
     # Remote-compute / infrastructure secrets
     "MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET", "DAYTONA_API_KEY",
+    # Kanban claim capability (dispatcher→worker only). A child presenting
+    # worker identity env plus this token could mutate the live-claimed task
+    # the env names; it must never cross any spawn surface (see
+    # agent/delegation_context.py KANBAN_ENV_KEYS for the delegated-child
+    # scrub; this covers every other spawned subprocess).
+    "HERMES_KANBAN_CLAIM_TOKEN",
 })

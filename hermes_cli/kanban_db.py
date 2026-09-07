@@ -118,6 +118,78 @@ _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024  # one cap for dashboard, tools and CLI
 
 
+CLAIM_TOKEN_ENV = "HERMES_KANBAN_CLAIM_TOKEN"
+
+
+def _hash_claim_token(token: str) -> str:
+    """SHA-256 hex digest of a raw claim token (constant-length, no salt needed:
+    the token is 256-bit random, not user-chosen)."""
+    import hashlib
+
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _worker_claim_token() -> Optional[str]:
+    """Raw claim token from the dispatcher-spawned worker environment."""
+    return os.environ.get(CLAIM_TOKEN_ENV) or None
+
+
+_WORKER_IDENTITY_ENV_VARS = (
+    "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK", CLAIM_TOKEN_ENV,
+)
+
+
+def _presents_worker_env() -> bool:
+    """True when this process carries dispatcher-spawned worker identity env.
+
+    Any process presenting that identity — including a delegate_task
+    grandchild that merely unset ``HERMES_DELEGATED_CHILD_CONTEXT`` — must
+    prove ownership with the per-claim token. A process with none of these
+    variables (operator shell, gateway, dashboard, tests) is outside the
+    worker-impersonation threat model by construction.
+    """
+    return any(os.environ.get(var) for var in _WORKER_IDENTITY_ENV_VARS)
+
+
+def _assert_worker_env_claim(conn: sqlite3.Connection) -> None:
+    """Board-mutation gate for processes presenting worker identity env.
+
+    The env task/run/lock are inheritable by any child; the per-claim token is
+    not (scrubbed from every Hermes child-spawn surface). So a caller that
+    presents ``HERMES_KANBAN_TASK``/``RUN_ID``/``CLAIM_LOCK``/``CLAIM_TOKEN``
+    must also present the token matching the run it names, or it is a stripped
+    or spoofed lineage: refuse every mutation. Runs claimed before this gate
+    existed store no hash; their workers are refused until the task is
+    redispatched (self-healing via the normal crash/reclaim path).
+    """
+    if not _presents_worker_env():
+        return
+    import hmac as _hmac
+
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    run_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
+    token = _worker_claim_token()
+    if not task_id or not run_raw or not token:
+        raise PermissionError(
+            "dispatcher worker identity is present in the environment without a valid "
+            "claim token (HERMES_KANBAN_CLAIM_TOKEN); refusing the board mutation. "
+            "Run from a clean operator shell without HERMES_KANBAN_* variables, or "
+            "let the dispatched worker — which holds the token — perform it.")
+    try:
+        run_id = int(run_raw)
+    except ValueError:
+        raise PermissionError("malformed HERMES_KANBAN_RUN_ID; refusing the board mutation")
+    row = conn.execute(
+        "SELECT claim_token_hash FROM task_runs WHERE id = ? AND task_id = ?",
+        (run_id, task_id),
+    ).fetchone()
+    stored = _row_get(row, "claim_token_hash") if row else None
+    if not stored or not _hmac.compare_digest(stored, _hash_claim_token(token)):
+        raise PermissionError(
+            "HERMES_KANBAN_CLAIM_TOKEN does not match the run named by "
+            "HERMES_KANBAN_RUN_ID; refusing the board mutation.")
+
+
 def _assert_not_delegated_child_mutation() -> None:
     """Reject Kanban mutations from ``delegate_task`` child contexts.
 
@@ -710,6 +782,11 @@ class Task:
     # done / budget exhausted (-> kanban_block); ``goal_max_turns`` None -> goals default.
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None
+    # Raw per-claim capability token. ONLY set on the Task object returned by
+    # ``claim_task`` for the dispatcher to export into the worker env; never
+    # persisted (only its SHA-256 digest is stored on the run row) and never
+    # included in serialisations (from_row leaves it None).
+    claim_token: Optional[str] = None
     session_id: Optional[str] = None         # originating HERMES_SESSION_ID; NULL from CLI/dashboard
     # VALID_BLOCK_KINDS or None (legacy); kept across unblock so a same-kind re-block reads as a loop.
     block_kind: Optional[str] = None
@@ -992,7 +1069,12 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- SHA-256 of the per-claim capability token handed only to the spawned
+    -- worker (HERMES_KANBAN_CLAIM_TOKEN). Never the raw token: the digest is
+    -- what a mutator must match to end this run. NULL for runs that predate
+    -- the token or were synthesized (never claimed).
+    claim_token_hash    TEXT
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -2089,10 +2171,12 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
 
 def _claim_and_open_run(
     conn: sqlite3.Connection, task_id: str, source_status: str, lock: str, expires: int, now: int,
-    *, event_extra: Optional[dict] = None,
+    *, event_extra: Optional[dict] = None, claim_token: Optional[str] = None,
 ) -> Optional[int]:
     """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
-    when the CAS lost. Caller holds the txn."""
+    when the CAS lost. Caller holds the txn. When *claim_token* is given its
+    SHA-256 digest is stored on the run row: that digest — matchable only by
+    the process holding the raw token — is what authorises ending this run."""
     cur = conn.execute(
         f"""
         UPDATE tasks
@@ -2117,12 +2201,13 @@ def _claim_and_open_run(
         INSERT INTO task_runs (
             task_id, profile, step_key, status,
             claim_lock, claim_expires, max_runtime_seconds,
-            started_at
-        ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+            started_at, claim_token_hash
+        ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
         """,
         (
             task_id, trow["assignee"] if trow else None, trow["current_step_key"] if trow else None,
             lock, expires, trow["max_runtime_seconds"] if trow else None, now,
+            _hash_claim_token(claim_token) if claim_token else None,
         ),
     )
     run_id = run_cur.lastrowid
@@ -2146,6 +2231,7 @@ def claim_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    claim_token = secrets.token_urlsafe(32)
     with write_txn(conn):
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
@@ -2161,10 +2247,13 @@ def claim_task(
         _reclaim_dangling_run(
             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
         )
-        run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
+        run_id = _claim_and_open_run(
+            conn, task_id, "ready", lock, expires, now, claim_token=claim_token)
         if run_id is None:
             return None
         claimed = get_task(conn, task_id)
+    if claimed is not None:
+        claimed.claim_token = claim_token  # raw token: dispatcher env only, never persisted
     _fire_task_hook("kanban_task_claimed", claimed, task_id, run_id)
     return claimed
 
@@ -2179,6 +2268,7 @@ def claim_review_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    claim_token = secrets.token_urlsafe(32)
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
@@ -2192,11 +2282,15 @@ def claim_review_task(
                 )
             return None
         run_id = _claim_and_open_run(
-            conn, task_id, "review", lock, expires, now, event_extra={"source_status": "review"},
+            conn, task_id, "review", lock, expires, now,
+            event_extra={"source_status": "review"}, claim_token=claim_token,
         )
         if run_id is None:
             return None
-        return get_task(conn, task_id)
+        claimed = get_task(conn, task_id)
+    if claimed is not None:
+        claimed.claim_token = claim_token
+    return claimed
 
 
 def _retry_status_for_run(
@@ -2258,18 +2352,27 @@ def heartbeat_claim(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
 ) -> bool:
-    """Extend a running claim; True if we still own it."""
-    expires = int(time.time()) + _resolve_claim_ttl_seconds(ttl_seconds)
-    lock = claimer or _claimer_id()
-    with write_txn(conn):
-        cur = conn.execute(
-            "UPDATE tasks SET claim_expires = ? "
-            "WHERE id = ? AND status = 'running' AND claim_lock = ?", (expires, task_id, lock),
-        )
-        if cur.rowcount != 1:
-            return False
-        _extend_run_claim(conn, task_id, expires)
-        return True
+    """Extend a running claim; True if we still own it.
+
+    A worker whose claim-token no longer matches the current run (the task was
+    reclaimed and redispatched) has lost the claim: report that as ``False``
+    rather than raising, so the liveness path degrades like any other lost
+    CAS instead of crashing the worker."""
+    try:
+        expires = int(time.time()) + _resolve_claim_ttl_seconds(ttl_seconds)
+        lock = claimer or _claimer_id()
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET claim_expires = ? "
+                "WHERE id = ? AND status = 'running' AND claim_lock = ?",
+                (expires, task_id, lock),
+            )
+            if cur.rowcount != 1:
+                return False
+            _extend_run_claim(conn, task_id, expires)
+            return True
+    except PermissionError:
+        return False
 
 
 def _extend_run_claim(conn: sqlite3.Connection, task_id: str, expires: int) -> Optional[int]:
@@ -2414,7 +2517,8 @@ def reclaim_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None, signal_fn=None,
 ) -> bool:
     """Operator reclaim regardless of TTL: release the claim, restore the source
-    phase, reset the failure counter. False when not running."""
+    phase, reset the failure counter. False when not running. Ownership is
+    enforced by the :func:`write_txn` identity gate (``_assert_worker_env_claim``)."""
     row = conn.execute(
         "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
@@ -2548,6 +2652,10 @@ def complete_task(
     ``created_cards`` are verified first — a phantom id raises
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
+
+    Ownership: every write passes through :func:`write_txn`, whose identity
+    gate (``_assert_worker_env_claim``) requires any process presenting
+    worker identity env to hold the matching per-claim token.
     """
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
@@ -2910,7 +3018,8 @@ def block_task(
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
     :func:`_route_block`). ``transient`` still counts toward the loop breaker
-    so a forever-flaky task escalates. True on any transition."""
+    so a forever-flaky task escalates. True on any transition. Ownership is
+    enforced by the :func:`write_txn` identity gate (``_assert_worker_env_claim``)."""
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
     with write_txn(conn):
@@ -3112,7 +3221,8 @@ def request_changes(
 ) -> tuple[bool, Optional[str]]:
     """Close an active reviewer run (claimed from ``review``) and hand the task
     back to the implementer from the latest ``review_requested`` event, parent
-    gating reapplied. Returns ``(ok, implementer | reason)``."""
+    gating reapplied. Returns ``(ok, implementer | reason)``. Ownership is
+    enforced by the :func:`write_txn` identity gate (``_assert_worker_env_claim``)."""
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
@@ -3689,7 +3799,8 @@ def schedule_task(
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
-    until ``unblock_task`` re-gates it."""
+    until ``unblock_task`` re-gates it. Ownership is enforced by the
+    :func:`write_txn` identity gate (``_assert_worker_env_claim``)."""
     with write_txn(conn):
         params: list[Any] = [task_id]
         sql = """

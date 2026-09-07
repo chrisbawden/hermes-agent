@@ -52,12 +52,16 @@ def _make_running_kanban_task(monkeypatch, tmp_path):
         )
         claim = kb.claim_task(conn, tid)
         assert claim is not None
-        run_id = claim.id
+        run_id = claim.current_run_id
+        claim_token = claim.claim_token
     finally:
         conn.close()
 
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    # Faithful dispatcher export (the write_txn identity gate requires the
+    # per-claim token for any process presenting worker identity env).
+    monkeypatch.setenv(kb.CLAIM_TOKEN_ENV, claim_token)
     return kb, tid, workspace, attachments_root
 
 
@@ -181,8 +185,19 @@ def test_delegate_child_kanban_cli_cannot_delete_parent_board(
         monkeypatch,
         tmp_path,
     )
+    # Board creation is operator scope: the write_txn identity gate refuses it
+    # from a process presenting dispatcher worker identity (the worker is
+    # pinned to its own board). Drop the identity for this setup step, then
+    # restore it so the child-scrub coverage below is unchanged.
+    identity_vars = ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", kb.CLAIM_TOKEN_ENV)
+    saved = {v: os.environ.get(v) for v in identity_vars}
+    for v in identity_vars:
+        monkeypatch.delenv(v, raising=False)
     kb.create_board("victim")
     assert kb.board_exists("victim")
+    for v, value in saved.items():
+        if value is not None:
+            monkeypatch.setenv(v, value)
 
     from agent.delegation_context import delegated_child_context
     from tools.environments.local import LocalEnvironment

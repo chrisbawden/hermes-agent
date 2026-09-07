@@ -28,6 +28,9 @@ def review_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
         assert task is not None
     monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    # The dispatcher exports the per-claim capability token to the worker; a
+    # faithful worker simulation must carry it (write_txn identity gate).
+    monkeypatch.setenv(kb.CLAIM_TOKEN_ENV, task.claim_token)
     return task_id
 
 
@@ -61,6 +64,9 @@ def test_review_tools_redact_handoff_and_route_changes(
 
     monkeypatch.setenv("HERMES_PROFILE", "reviewer")
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+    # The reviewer run is a NEW claim with its own token; refresh the env like
+    # the dispatcher does for the reviewer worker it spawns.
+    monkeypatch.setenv(kb.CLAIM_TOKEN_ENV, review.claim_token)
     change_secret = "sk-" + "B" * 32
     changed = json.loads(
         tools._handle_request_changes({
@@ -131,6 +137,7 @@ def test_review_cli_round_trip_preserves_handoff(
         assert implementation is not None
     monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(implementation.current_run_id))
+    monkeypatch.setenv(kb.CLAIM_TOKEN_ENV, implementation.claim_token)
 
     output = kc.run_slash(
         f"request-review {task_id} --summary 'ready for review' "
@@ -148,6 +155,7 @@ def test_review_cli_round_trip_preserves_handoff(
         review = kb.claim_review_task(conn, task_id, claimer="reviewer:1")
         assert review is not None
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+    monkeypatch.setenv(kb.CLAIM_TOKEN_ENV, review.claim_token)
 
     output = kc.run_slash(
         f"request-changes {task_id} 'cover the malformed payload case'"
@@ -305,6 +313,7 @@ def test_goal_mode_review_handoff_cannot_bypass_judge(
         assert claimed is not None
     monkeypatch.setenv("HERMES_KANBAN_TASK", tool_task)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    monkeypatch.setenv(kb.CLAIM_TOKEN_ENV, claimed.claim_token)
 
     from tools import kanban_tools as tools
 
@@ -340,6 +349,7 @@ def test_goal_mode_review_handoff_cannot_bypass_judge(
         assert cli_claimed is not None
     monkeypatch.setenv("HERMES_KANBAN_TASK", cli_task)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(cli_claimed.current_run_id))
+    monkeypatch.setenv(kb.CLAIM_TOKEN_ENV, cli_claimed.claim_token)
 
     import agent.auxiliary_client as auxiliary_client
     from hermes_cli import goals
