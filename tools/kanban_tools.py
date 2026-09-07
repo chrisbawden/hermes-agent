@@ -306,6 +306,44 @@ def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
     return int(value) if value is not None else default
 
 
+def _coerce_review_of(value: Any) -> Optional[tuple[str, str, str]]:
+    """``[artifact_digest, rubric_digest, review_class]`` -> strict tuple."""
+    if value in (None, ""):
+        return None
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise _Reject(
+            "access_review_of must be a 3-item list: "
+            "[artifact_digest, rubric_digest, review_class]"
+        )
+    parts = tuple(str(item).strip() for item in value)
+    if not all(parts):
+        raise _Reject(
+            "access_review_of items must be non-empty: "
+            "[artifact_digest, rubric_digest, review_class]"
+        )
+    return parts  # type: ignore[return-value]
+
+
+def _coerce_continuation_of(value: Any) -> Optional[tuple[str, str, str]]:
+    """``[outcome_key, unit_digest, predecessor_id]`` -> 3-tuple, else None.
+
+    Strictly three non-empty strings — a malformed continuation descriptor
+    is rejected loudly rather than silently creating an unkeyed task.
+    """
+    if value in (None, ""):
+        return None
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise _Reject(
+            "access_continuation_of must be a 3-item list: "
+            "[outcome_key, unit_digest, predecessor_task_id]")
+    parts = tuple(str(item).strip() for item in value)
+    if not all(parts):
+        raise _Reject(
+            "access_continuation_of items must be non-empty: "
+            "[outcome_key, unit_digest, predecessor_task_id]")
+    return parts  # type: ignore[return-value]
+
+
 _TASK_FIELDS = tuple(
     "id title body assignee status tenant priority workspace_kind workspace_path created_by "
     "created_at started_at completed_at result current_run_id model_override "
@@ -599,6 +637,14 @@ def _handle_block(args: dict, **kw) -> str:
     reason = _redact(
         _require_text(args, "reason", "reason is required — explain what input you need"))
     kind = args.get("kind")
+    # Semantic recurrence fingerprint (default-off kanban.access_units.
+    # semantic_recurrence): outcome/unit/actor/action/provider/reason — lets
+    # the loop breaker tell guided-session progress from true repeats. The
+    # fingerprint is structured, not free text: redaction is unnecessary and
+    # would corrupt the comparison, but it IS length-capped like a reason.
+    semantic_fingerprint = args.get("semantic_fingerprint")
+    if semantic_fingerprint is not None:
+        semantic_fingerprint = str(semantic_fingerprint).strip()[:512] or None
     with _board(args.get("board")) as (kb, conn):
         _check(kind is None or kind in kb.VALID_BLOCK_KINDS,
                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)")
@@ -618,7 +664,10 @@ def _handle_block(args: dict, **kw) -> str:
                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). If the task is actually "
                f"finished or cannot proceed for another reason, call kanban_complete instead — "
                f"the completion judge will evaluate it.")
-        ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid))
+        ok = kb.block_task(
+            conn, tid, reason=reason, kind=kind,
+            expected_run_id=_worker_run_id(tid),
+            semantic_fingerprint=semantic_fingerprint)
         _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
         return _ok_landed(kb, conn, tid, "blocked", block_kind=kind)
 
@@ -640,12 +689,15 @@ def _handle_request_review(args: dict, **kw) -> str:
     reviewer = _redact_opt(args.get("reviewer") or None)
     with _board(args.get("board")) as (kb, conn):
         _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary)
-        ok, fail_reason = kb.request_review(
+        ok, detail = kb.request_review(
             conn, tid, summary=summary, metadata=metadata, reviewer=reviewer,
+            access_review_of=_coerce_review_of(args.get("access_review_of")),
             expected_run_id=_worker_run_id(tid), with_reason=True)
         _check(ok, f"could not request review for {tid}: "
-                   f"{fail_reason or 'unknown id or not in running/ready'}")
-        return _ok_landed(kb, conn, tid, "review")
+                   f"{detail or 'unknown id or not in running/ready'}")
+        landed_tid = detail or tid
+        extra = {"converged_from": tid} if landed_tid != tid else {}
+        return _ok_landed(kb, conn, landed_tid, "review", **extra)
 
 
 @_kanban_handler("kanban_request_changes")
@@ -846,7 +898,15 @@ def _handle_create(args: dict, **kw) -> str:
             model_override=model_override, provider_override=provider_override,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             initial_status=str(args.get("initial_status") or "running"),
-            created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id)
+            created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id,
+            access_outcome_key=args.get("access_outcome_key"),
+            access_review_of=_coerce_review_of(args.get("access_review_of")),
+            access_continuation_of=_coerce_continuation_of(args.get("access_continuation_of")),
+            access_collision_resources=_coerce_str_list(
+                args.get("access_collision_resources"),
+                "access_collision_resources", "collision declarations", strip=True,
+            ),
+        )
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         return _ok(task_id=new_tid, **landed, subscribed=_maybe_auto_subscribe(conn, new_tid))
 
