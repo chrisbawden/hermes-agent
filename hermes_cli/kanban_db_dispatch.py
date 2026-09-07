@@ -1252,42 +1252,46 @@ def check_respawn_guard(
         if not requeued_after:
             return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    # 4. GitHub PR URLs in recent comments — prior work already opened a PR.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    pr_comments = [
+    own_pr_comments = [
         c for c in conn.execute(
-            "SELECT body, created_at FROM task_comments WHERE task_id = ? AND created_at >= ?",
+            "SELECT task_id, body, created_at FROM task_comments "
+            "WHERE task_id = ? AND created_at >= ?",
             (task_id, pr_cutoff),
         ).fetchall()
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"])
     ]
-    if pr_comments:
-        if flags is not None and flags.get("narrow_pr_guards"):
-            # Narrow guard: block ONLY on genuine resource overlap. The task
-            # declares its collision surface via access_collision_resources
-            # events. No declaration = the opt-in is absent, so the LEGACY
-            # broad guard keeps applying (fall through). One durable
-            # pr_collision_wait event replaces the per-tick event storm.
-            declared = _latest_collision_declaration(conn, task_id)
-            if declared is not None:
-                if _declaration_overlaps_prs(declared, pr_comments):
-                    overlap = _parse_declaration_resources(declared)
-                    if overlap is not None:
-                        record_pr_collision_wait(conn, task_id, overlap, reason="active_pr")
-                    return "active_pr"
-                return None  # declared unrelated surface: work proceeds
-        for c in pr_comments:
-            comment_at = int(c["created_at"] or 0)
-            pr_requeued_after = conn.execute(
-                "SELECT 1 FROM task_events "
-                "WHERE task_id = ? AND created_at >= ? "
-                "AND kind IN ('status', 'promoted', 'promoted_manual', "
-                "'unblocked', 'reclaimed') "
-                "LIMIT 1",
-                (task_id, comment_at),
-            ).fetchone()
-            if not pr_requeued_after:
+    if flags is not None and flags.get("narrow_pr_guards"):
+        # Real narrow path: the candidate opts in by declaring a bounded
+        # collision surface. Compare it with every recent PR owner's declared
+        # surface. If an older owner has no declaration, its PR repository is
+        # the conservative broad fallback. A same-task explicit requeue after
+        # the PR comment bypasses the guard (#104277).
+        declared = _latest_collision_declaration(conn, task_id)
+        mine = _parse_declaration_resources(declared) if declared is not None else None
+        if mine is not None:
+            board_pr_comments = [
+                c for c in conn.execute(
+                    "SELECT task_id, body, created_at FROM task_comments "
+                    "WHERE created_at >= ? ORDER BY id",
+                    (pr_cutoff,),
+                ).fetchall()
+                if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"])
+            ]
+            overlap = _find_overlapping_pr_resources(
+                conn, task_id, mine, board_pr_comments,
+            )
+            if overlap is not None:
+                record_pr_collision_wait(conn, task_id, overlap, reason="active_pr")
                 return "active_pr"
+            return None
+
+    # Flag off (or no candidate declaration): exact legacy per-task broad
+    # behaviour, including the explicit requeue bypass from upstream #104277.
+    for c in own_pr_comments:
+        if not _pr_requeued_after(conn, task_id, c):
+            return "active_pr"
 
     return None
 
@@ -1310,24 +1314,53 @@ def _latest_collision_declaration(conn, task_id) -> Optional[dict]:
     return declared if isinstance(declared, dict) else None
 
 
-def _declaration_overlaps_prs(declared: dict, pr_comments) -> bool:
-    """True iff the declared repositories/files overlap any PR comment repo."""
-    from hermes_cli.kanban_access_units import CollisionResources, resources_overlap
+def _pr_requeued_after(conn, task_id: str, comment) -> bool:
+    """Whether task had an explicit retry/requeue at or after a PR comment."""
+    comment_at = int(comment["created_at"] or 0)
+    return conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND created_at >= ? "
+        "AND kind IN ('status', 'promoted', 'promoted_manual', "
+        "'unblocked', 'reclaimed') LIMIT 1",
+        (task_id, comment_at),
+    ).fetchone() is not None
 
-    mine = _parse_declaration_resources(declared)
-    if mine is None:
-        return False
-    pr_repos: set[str] = set()
-    for c in pr_comments:
-        for match in _RESPAWN_GUARD_PR_URL_RE.finditer(c["body"] or ""):
-            parts = match.group(0).split("/")
-            if len(parts) >= 5:
-                pr_repos.add(f"{parts[3]}/{parts[4]}".casefold())
-    if not pr_repos:
-        return False
-    pr_resources = CollisionResources()
-    pr_resources.repositories = pr_repos
-    return resources_overlap(mine, pr_resources)
+
+def _pr_url_resources(body: str):
+    """Broad repository resources inferred from PR URLs in one comment."""
+    from hermes_cli.kanban_access_units import CollisionResources
+
+    resources = CollisionResources()
+    for match in _RESPAWN_GUARD_PR_URL_RE.finditer(body or ""):
+        parts = match.group(0).split("/")
+        if len(parts) >= 5:
+            resources.repositories.add(f"{parts[3]}/{parts[4]}".casefold())
+    return resources
+
+
+def _find_overlapping_pr_resources(conn, task_id: str, mine, pr_comments):
+    """First active-PR resource surface overlapping ``mine``, or ``None``.
+
+    Another task's real declaration supplies file/service/schema/secret/profile
+    granularity. Legacy PR owners without declarations fall back to the URL's
+    broad repo. A task's own comment uses the URL repo (rather than comparing
+    its declaration to itself) and honours the explicit requeue bypass.
+    """
+    from hermes_cli.kanban_access_units import resources_overlap
+
+    for comment in pr_comments:
+        owner = comment["task_id"]
+        if owner == task_id:
+            if _pr_requeued_after(conn, task_id, comment):
+                continue
+            theirs = _pr_url_resources(comment["body"])
+        else:
+            owner_decl = _latest_collision_declaration(conn, owner)
+            theirs = _parse_declaration_resources(owner_decl) if owner_decl is not None else None
+            if theirs is None:
+                theirs = _pr_url_resources(comment["body"])
+        if resources_overlap(mine, theirs):
+            return mine
+    return None
 
 
 def _parse_declaration_resources(declared: dict) -> Optional[Any]:
@@ -1641,6 +1674,7 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    access_unit_flags: Optional[dict[str, bool]] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -1662,17 +1696,28 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
-    guard_reason = check_respawn_guard(conn, task_id, lane=lane)
+    guard_reason = check_respawn_guard(
+        conn, task_id, lane=lane, flags=access_unit_flags,
+    )
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
-        # Event so ``hermes kanban tail`` shows why the task looks stuck.
+        # Event so ``hermes kanban tail`` shows why the task looks stuck. A
+        # narrow active-PR wait already wrote its single durable
+        # ``pr_collision_wait`` event; do not also append legacy
+        # ``respawn_guarded`` on every tick.
+        narrow_pr_wait = bool(
+            guard_reason == "active_pr"
+            and access_unit_flags
+            and access_unit_flags.get("narrow_pr_guards")
+            and _latest_collision_declaration(conn, task_id) is not None
+        )
         # Honour kanban.default_assignee: when the dispatcher hits an unassigned ready task and an
         # operator-configured fallback exists, persist the assignment and proceed. This removes the
         # dashboard footgun where a task created without an assignee parks in 'ready' forever even though
         # the operator's intent ("default") was perfectly clear (#27145). Mutating the row (not just the
         # in-memory view) keeps diagnostics and the board state consistent: the task is now legitimately
         # owned by ``kanban.default_assignee``, not "unassigned but secretly routed".
-        if not dry_run:
+        if not dry_run and not narrow_pr_wait:
             with _kb.write_txn(conn):
                 _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
         return False
@@ -1951,6 +1996,7 @@ def _dispatch_once_locked(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        access_unit_flags=_kb._access_unit_flags(),
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0

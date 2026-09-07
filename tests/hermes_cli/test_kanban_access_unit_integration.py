@@ -163,6 +163,77 @@ def test_duplicate_review_watchdog_observes_existing_card(conn, flags):
     assert dup == existing
 
 
+def test_duplicate_request_review_converges_and_archives_duplicate(conn, flags):
+    """Normal lifecycle path: a second task requesting the same review tuple
+    converges on the active review and cannot remain an orphan active card."""
+    flags["review_keys"] = True
+    descriptor = ("sha256:aaa", "sha256:bbb", "independent")
+    first = kb.create_task(conn, title="review first", assignee="nadia")
+    duplicate = kb.create_task(conn, title="review duplicate", assignee="nadia")
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='ready' WHERE id IN (?, ?)", (first, duplicate))
+
+    ok1, landed1 = kb.request_review(
+        conn, first, access_review_of=descriptor, with_reason=True,
+    )
+    ok2, landed2 = kb.request_review(
+        conn, duplicate, access_review_of=descriptor, with_reason=True,
+    )
+    assert (ok1, landed1) == (True, first)
+    assert (ok2, landed2) == (True, first)
+    first_task = kb.get_task(conn, first)
+    duplicate_task = kb.get_task(conn, duplicate)
+    assert first_task is not None and first_task.status == "review"
+    assert duplicate_task is not None and duplicate_task.status == "archived"
+    active = conn.execute(
+        "SELECT COUNT(*) FROM access_units WHERE unit_class='review' AND released_at IS NULL"
+    ).fetchone()[0]
+    assert active == 1
+
+
+def test_concurrent_review_creation_converges_without_orphan_active_cards(
+    kanban_home, flags,
+):
+    """Separate connections race the real create_task review descriptor.
+    Exactly one card commits; all callers observe it and no orphan survives."""
+    import threading
+
+    flags["review_keys"] = True
+    descriptor = ("sha256:head", "sha256:rubric", "independent")
+    outcomes: list[str] = []
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(6)
+
+    def create(index: int) -> None:
+        try:
+            barrier.wait()
+            with kbc.connect_closing() as thread_conn:
+                outcomes.append(kb.create_task(
+                    thread_conn, title=f"review {index}", assignee="vladamir",
+                    access_review_of=descriptor,
+                ))
+        except BaseException as exc:  # test thread must report, not disappear
+            errors.append(exc)
+
+    threads = [threading.Thread(target=create, args=(i,)) for i in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert not any(thread.is_alive() for thread in threads)
+    assert errors == []
+    assert len(set(outcomes)) == 1
+    with kbc.connect_closing() as check:
+        active_cards = check.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'archived')"
+        ).fetchone()[0]
+        active_reviews = check.execute(
+            "SELECT COUNT(*) FROM access_units WHERE unit_class='review' AND released_at IS NULL"
+        ).fetchone()[0]
+    assert active_cards == 1
+    assert active_reviews == 1
+
+
 def test_new_artifact_digest_permits_re_review(conn, flags):
     flags["review_keys"] = True
     key = kau.build_review_key("sha256:aaa", "sha256:bbb", "independent")
@@ -373,6 +444,79 @@ def test_pr_guard_flag_off_keeps_broad_guard(conn, flags):
     assert kbd.check_respawn_guard(conn, guarded, lane="ready") == "active_pr"
 
 
+def test_narrow_guard_preserves_explicit_requeue_bypass(conn, flags):
+    """Upstream #104277: a same-task requeue after its PR comment is an
+    explicit instruction to continue that card, even with narrow guards on."""
+    flags["narrow_pr_guards"] = True
+    tid = kb.create_task(
+        conn, title="continue PR", assignee="nadia",
+        access_collision_resources=["file:acme/erp:src/app.py"],
+    )
+    kb.add_comment(conn, tid, author="nadia", body=PR_COMMENT_SAME_REPO)
+    with kb.write_txn(conn):
+        kb._append_event(conn, tid, "promoted_manual", {"reason": "explicit correction"})
+    assert kbd.check_respawn_guard(
+        conn, tid, lane="ready", flags=kb._access_unit_flags(),
+    ) is None
+
+
+def test_dispatcher_narrow_guard_waits_once_and_spawns_disjoint_file(
+    conn, flags, monkeypatch,
+):
+    """Real dispatcher path: configured flags reach the guard; five ticks
+    yield one durable wait (and no legacy event storm) for an overlapping
+    active PR, while same-repo disjoint-file work proceeds."""
+    import os
+
+    flags["narrow_pr_guards"] = True
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: (lambda _name: True))
+
+    pr_owner = kb.create_task(
+        conn, title="existing PR", assignee="nadia",
+        access_collision_resources=["file:acme/erp:src/orders.py"],
+    )
+    kb.add_comment(
+        conn, pr_owner, author="nadia",
+        body="Opened https://github.com/acme/erp/pull/42",
+    )
+    # It is evidence-only for this fixture, not dispatchable work.
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (pr_owner,))
+
+    overlapping = kb.create_task(
+        conn, title="same file", assignee="nadia",
+        access_collision_resources=["file:acme/erp:src/orders.py"],
+    )
+    disjoint = kb.create_task(
+        conn, title="other file", assignee="nadia",
+        access_collision_resources=["file:acme/erp:src/customers.py"],
+    )
+
+    spawned: list[str] = []
+
+    def spawn(task, _workspace):
+        spawned.append(task.id)
+        return os.getpid()
+
+    for _ in range(5):
+        kbd.dispatch_once(
+            conn, spawn_fn=spawn, reconcile_orphans=False,
+            max_in_progress=8,
+        )
+
+    assert spawned == [disjoint]
+    overlapping_task = kb.get_task(conn, overlapping)
+    disjoint_task = kb.get_task(conn, disjoint)
+    assert overlapping_task is not None and overlapping_task.status == "ready"
+    assert disjoint_task is not None and disjoint_task.status == "running"
+    events = conn.execute(
+        "SELECT kind, COUNT(*) AS n FROM task_events WHERE task_id = ? "
+        "AND kind IN ('pr_collision_wait', 'respawn_guarded') GROUP BY kind",
+        (overlapping,),
+    ).fetchall()
+    assert {row["kind"]: row["n"] for row in events} == {"pr_collision_wait": 1}
+
+
 # ---------------------------------------------------------------------------
 # stale_reconciliation
 # ---------------------------------------------------------------------------
@@ -388,17 +532,22 @@ def test_completion_releases_key_and_reconciles(conn, flags):
     assert kau.active_access_unit(conn, key) is None  # released on completion
 
 
-def test_reconciliation_flag_off_keeps_key_active(conn, flags):
-    """Flag off: completion does NOT release the key (feature inert)."""
+def test_outcome_key_completion_releases_without_reconciliation(conn, flags):
+    """Outcome-key uniqueness is independently one NON-terminal unit: even
+    with stale_reconciliation off, completion releases its registry owner."""
     flags["outcome_keys"] = True
     key = kau.build_outcome_key("ruth", "ga4", "properties/3", "read_only")
     tid = kb.create_task(conn, title="unit", assignee="vladamir", access_outcome_key=key)
     with kb.write_txn(conn):
         conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
     assert kb.complete_task(conn, tid, summary="verified") is True
-    assert kau.active_access_unit(conn, key) == tid
-    # Cleanup so later assertions in other tests are unaffected.
-    kau.release_access_unit(conn, key)
+    assert kau.active_access_unit(conn, key) is None
+    row = conn.execute(
+        "SELECT released_at, release_reason FROM access_units WHERE key = ? AND task_id = ?",
+        (key, tid),
+    ).fetchone()
+    assert row["released_at"] is not None
+    assert row["release_reason"] == "completed"
 
 
 # ---------------------------------------------------------------------------
@@ -417,3 +566,55 @@ def test_independent_units_have_no_parent_edge(conn, flags):
     assert kb.parent_ids(conn, b) == []
     assert kb.child_ids(conn, a) == []
     assert kb.child_ids(conn, b) == []
+
+
+# ---------------------------------------------------------------------------
+# Review-found regressions (t_e1bf786b): unsafe global reconciliation and
+# terminal-key deadlock. Probes first reproduced independently against
+# head d734364c91 in a fixture board; both failed before the fixes.
+# ---------------------------------------------------------------------------
+
+def test_completed_successor_must_not_archive_unrelated_active_unit(conn, flags):
+    """Probe A: completing one outcome's unit must never archive or release
+    an unrelated, independently registered, non-terminal unit — regardless of
+    which flags are on. Reconciliation is scoped to the verified outcome."""
+    flags["outcome_keys"] = True
+    flags["stale_reconciliation"] = True
+    unrelated_key = kau.build_outcome_key("ruth", "quickfile", "reports", "read_only")
+    unrelated = kb.create_task(
+        conn, title="unfinished QuickFile", assignee="vladamir",
+        access_outcome_key=unrelated_key,
+    )
+    successor_key = kau.build_outcome_key("ruth", "ga4", "property/1", "read_only")
+    successor = kb.create_task(
+        conn, title="verified GA4 successor", assignee="vladamir",
+        access_outcome_key=successor_key,
+    )
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (successor,))
+    assert kb.complete_task(conn, successor, summary="verified") is True
+    unrelated_task = kb.get_task(conn, unrelated)
+    assert unrelated_task is not None and unrelated_task.status != "archived"
+    # The unrelated unit keeps its key: independent active outcomes are never
+    # archived or released by another outcome's reconciliation.
+    assert kau.active_access_unit(conn, unrelated_key) == unrelated
+
+
+def test_terminal_owner_must_not_block_successor_without_reconcile_flag(conn, flags):
+    """Probe B: with outcome_keys on and stale_reconciliation OFF, a completed
+    owner stops blocking: creating the same outcome again yields a NEW task.
+    The uniqueness invariant is "one NON-TERMINAL unit", not "one row ever"."""
+    flags["outcome_keys"] = True
+    flags["stale_reconciliation"] = False
+    key = kau.build_outcome_key("ruth", "meta", "account/1", "read_only")
+    first = kb.create_task(conn, title="first", assignee="vladamir", access_outcome_key=key)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (first,))
+    assert kb.complete_task(conn, first, summary="done") is True
+    successor = kb.create_task(conn, title="successor", assignee="vladamir", access_outcome_key=key)
+    assert successor != first
+    assert kau.active_access_unit(conn, key) == successor
+    # History preserved: the terminal owner's registry row still exists.
+    rows = conn.execute(
+        "SELECT COUNT(*) FROM access_units WHERE key = ?", (key,)).fetchone()[0]
+    assert rows == 2

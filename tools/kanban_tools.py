@@ -306,6 +306,24 @@ def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
     return int(value) if value is not None else default
 
 
+def _coerce_review_of(value: Any) -> Optional[tuple[str, str, str]]:
+    """``[artifact_digest, rubric_digest, review_class]`` -> strict tuple."""
+    if value in (None, ""):
+        return None
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise _Reject(
+            "access_review_of must be a 3-item list: "
+            "[artifact_digest, rubric_digest, review_class]"
+        )
+    parts = tuple(str(item).strip() for item in value)
+    if not all(parts):
+        raise _Reject(
+            "access_review_of items must be non-empty: "
+            "[artifact_digest, rubric_digest, review_class]"
+        )
+    return parts  # type: ignore[return-value]
+
+
 def _coerce_continuation_of(value: Any) -> Optional[tuple[str, str, str]]:
     """``[outcome_key, unit_digest, predecessor_id]`` -> 3-tuple, else None.
 
@@ -671,12 +689,15 @@ def _handle_request_review(args: dict, **kw) -> str:
     reviewer = _redact_opt(args.get("reviewer") or None)
     with _board(args.get("board")) as (kb, conn):
         _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary)
-        ok, fail_reason = kb.request_review(
+        ok, detail = kb.request_review(
             conn, tid, summary=summary, metadata=metadata, reviewer=reviewer,
+            access_review_of=_coerce_review_of(args.get("access_review_of")),
             expected_run_id=_worker_run_id(tid), with_reason=True)
         _check(ok, f"could not request review for {tid}: "
-                   f"{fail_reason or 'unknown id or not in running/ready'}")
-        return _ok_landed(kb, conn, tid, "review")
+                   f"{detail or 'unknown id or not in running/ready'}")
+        landed_tid = detail or tid
+        extra = {"converged_from": tid} if landed_tid != tid else {}
+        return _ok_landed(kb, conn, landed_tid, "review", **extra)
 
 
 @_kanban_handler("kanban_request_changes")
@@ -879,7 +900,12 @@ def _handle_create(args: dict, **kw) -> str:
             initial_status=str(args.get("initial_status") or "running"),
             created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id,
             access_outcome_key=args.get("access_outcome_key"),
+            access_review_of=_coerce_review_of(args.get("access_review_of")),
             access_continuation_of=_coerce_continuation_of(args.get("access_continuation_of")),
+            access_collision_resources=_coerce_str_list(
+                args.get("access_collision_resources"),
+                "access_collision_resources", "collision declarations", strip=True,
+            ),
         )
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         return _ok(task_id=new_tid, **landed, subscribed=_maybe_auto_subscribe(conn, new_tid))

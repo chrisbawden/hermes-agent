@@ -14,9 +14,9 @@ Implements the accepted non-live Kanban control-plane design (Option A):
   repeat (same fingerprint) is recognised as a loop;
 * **narrow PR collision resources**: repository-scoped file/service/schema/
   secret/profile declarations that only collide on genuine overlap;
-* **idempotent successor reconciliation** that releases keys, archives
-  superseded duplicates without independent unfinished work, and NEVER
-  deletes registry rows or events (append-only history).
+* **idempotent successor reconciliation** that releases only the verified
+  task's explicitly owned keys, never archives independent unfinished work,
+  and NEVER deletes registry rows or events (append-only history).
 
 Everything here is inert unless the owning surface passes an explicitly
 enabled flag set (see :func:`flag_enabled`); default-off is a hard contract.
@@ -59,6 +59,8 @@ TERMINAL_TASK_STATUSES = frozenset({"done", "archived"})
 
 # Collision-resource prefixes accepted by parse_collision_resources.
 _RESOURCE_PREFIXES = ("repo", "file", "service", "schema", "secret", "profile")
+_MAX_COLLISION_DECLARATIONS = 64
+_MAX_COLLISION_DECLARATION_CHARS = 512
 
 
 class AccessUnitConflict(ValueError):
@@ -87,6 +89,26 @@ def _norm_field(field: str) -> str:
     if not text or "|" in text:
         raise ValueError("access key fields must be non-empty and pipe-free")
     return text
+
+
+def canonical_outcome_key(key: str) -> str:
+    """Canonicalise an already-built outcome key supplied by a caller.
+
+    The model-facing surfaces pass outcome keys as opaque strings; this is
+    the domain boundary that makes `` Ruth | GA4 | p/1 | read_only `` and
+    ``ruth|ga4|p/1|read_only`` the SAME key before they reach the registry,
+    so casing/spacing variants cannot fork (or bypass) uniqueness. A string
+    that is not four non-empty pipe-free fields is rejected loudly — a
+    malformed key is a caller bug, not a key to store.
+    """
+    text = str(key).strip()
+    parts = text.split("|")
+    if len(parts) != 4:
+        raise ValueError(
+            "access_outcome_key must be 'profile|provider|target|access_class' "
+            "(four non-empty pipe-free fields)"
+        )
+    return "|".join(_norm_field(part) for part in parts)
 
 
 def build_outcome_key(
@@ -129,11 +151,11 @@ def build_review_key(artifact_digest: str, rubric_digest: str, review_class: str
 def build_continuation_key(outcome_key: str, unit_digest: str, predecessor_id: str) -> str:
     """Atomic continuation key: outcome key + unit digest + terminal predecessor.
 
-    The outcome key is an opaque component here — it already contains the
-    field pipes, so only its casing is normalised.
+    The outcome key carries embedded field pipes, so it is validated and
+    canonicalised as a full outcome key before composition.
     """
     return "cont|" + "|".join((
-        str(outcome_key).strip().casefold(),
+        canonical_outcome_key(outcome_key),
         _norm_field(unit_digest), _norm_field(predecessor_id),
     ))
 
@@ -147,8 +169,22 @@ def _now() -> int:
 
 
 def _active_row(conn: sqlite3.Connection, key: str) -> Optional[sqlite3.Row]:
+    """The unreleased registry row for ``key`` whose owner is NON-terminal.
+
+    The uniqueness invariant is "one NON-TERMINAL unit per key", not "one
+    row ever": a row whose owning task is ``done``/``archived`` is not an
+    active unit even before it has been explicitly released (a flag may be
+    disabled, a process may have died mid-completion). Checking the owner's
+    live status in the same query — instead of trusting ``released_at`` —
+    makes the invariant hold independently of which combination of the six
+    default-off flags is enabled. Registry rows themselves are never
+    deleted here; read-only stale detection.
+    """
     return conn.execute(
-        "SELECT task_id FROM access_units WHERE key = ? AND released_at IS NULL",
+        "SELECT u.task_id FROM access_units u "
+        "JOIN tasks t ON t.id = u.task_id "
+        "WHERE u.key = ? AND u.released_at IS NULL "
+        "AND t.status NOT IN ('done', 'archived')",
         (key,),
     ).fetchone()
 
@@ -178,6 +214,15 @@ def register_access_unit(
             raise AccessUnitConflict(key, unit_class, active["task_id"])
         if active is not None:
             return  # idempotent re-register of the current owner
+        # The key may still be held by a TERMINAL owner (completed while a
+        # release flag was off, or a crash before the release landed). The
+        # invariant is "one non-terminal unit": release the stale row —
+        # preserving it, never deleting — and let the new owner register.
+        conn.execute(
+            "UPDATE access_units SET released_at = ?, release_reason = ? "
+            "WHERE key = ? AND released_at IS NULL",
+            (_now(), "owner_terminal", key),
+        )
         conn.execute(
             "INSERT INTO access_units (key, unit_class, task_id, created_by, created_at) "
             "VALUES (?, ?, ?, ?, ?)",
@@ -245,9 +290,9 @@ class CollisionResources:
     """Parsed ``prefix:value`` collision declarations for one task.
 
     ``files`` is a set of ``(repo, path)`` with the repo normalised; the
-    other classes keep their canonical declared token. Overlap rules (see
-    :func:`resources_overlap`): same repo always overlaps; otherwise only
-    an identical resource token overlaps.
+    other classes keep their canonical declared token. File declarations
+    do NOT imply a repository-wide declaration: disjoint files in one repo
+    remain independent. See :func:`resources_overlap`.
     """
 
     __slots__ = ("repositories", "files", "services", "schemas", "secrets", "profiles")
@@ -269,8 +314,20 @@ def parse_collision_resources(decls: Optional[IterableStr]) -> "CollisionResourc
     extra ``repo:path`` segment.
     """
     res = CollisionResources()
-    for decl in decls or ():
+    if isinstance(decls, (str, bytes)):
+        raise ValueError("collision resources must be an iterable of declarations, not a string")
+    items = list(decls or ())
+    if len(items) > _MAX_COLLISION_DECLARATIONS:
+        raise ValueError(
+            f"at most {_MAX_COLLISION_DECLARATIONS} collision resources may be declared"
+        )
+    for decl in items:
         text = str(decl).strip()
+        if len(text) > _MAX_COLLISION_DECLARATION_CHARS:
+            raise ValueError(
+                "collision resource declarations must be at most "
+                f"{_MAX_COLLISION_DECLARATION_CHARS} characters"
+            )
         if not text:
             continue
         prefix, sep, value = text.partition(":")
@@ -288,7 +345,6 @@ def parse_collision_resources(decls: Optional[IterableStr]) -> "CollisionResourc
             if not fsep or not repo.strip() or not path.strip():
                 raise ValueError(f"file collision resource must be 'file:owner/repo:path': {decl!r}")
             res.files.add((repo.strip().casefold(), path.strip()))
-            res.repositories.add(repo.strip().casefold())
         elif prefix == "service":
             res.services.add(value)
         elif prefix == "schema":
@@ -300,15 +356,35 @@ def parse_collision_resources(decls: Optional[IterableStr]) -> "CollisionResourc
     return res
 
 
+def collision_resources_payload(resources: CollisionResources) -> dict[str, list[str]]:
+    """Canonical durable payload for an ``access_collision_resources`` event."""
+    return {
+        "repositories": sorted(resources.repositories),
+        "files": [f"{repo}:{path}" for repo, path in sorted(resources.files)],
+        "services": sorted(resources.services),
+        "schemas": sorted(resources.schemas),
+        "secrets": sorted(resources.secrets),
+        "profiles": sorted(resources.profiles),
+    }
+
+
 def resources_overlap(a: CollisionResources, b: CollisionResources) -> bool:
     """True iff the two declared resource sets genuinely collide.
 
-    A PR/task guards only work overlapping the same repository (any shared
-    repo) or the exact same declared service/schema/secret/profile
-    resource. Unrelated repositories and unrelated resources never guard
-    each other — a PR URL alone is not a global guard.
+    Granularity is deliberate: identical files collide, while disjoint files
+    in one repository do not. An EXPLICIT ``repo:`` declaration is broad and
+    overlaps every explicit repo or file declaration in that repository.
+    Service/schema/secret/profile declarations overlap only on their exact
+    canonical token. Unrelated resources never guard each other.
     """
-    if a.repositories & b.repositories:
+    a_file_repos = {repo for repo, _path in a.files}
+    b_file_repos = {repo for repo, _path in b.files}
+    if (
+        a.repositories & b.repositories
+        or a.repositories & b_file_repos
+        or b.repositories & a_file_repos
+        or a.files & b.files
+    ):
         return True
     return bool(
         a.services & b.services
@@ -326,71 +402,38 @@ def reconcile_successor(
     conn: sqlite3.Connection, successor_task_id: str,
     *, reason: str = "successor_verified",
 ) -> dict[str, Any]:
-    """Idempotently reconcile the board after a successor unit verifies.
+    """Release the verified unit's OWN keys after its task completes.
 
-    Per active registry row: keys whose task is terminal (done/archived)
-    are released — preserving the row, never deleting history; keys whose
-    task is a live duplicate are archived ONLY when the duplicate has no
-    unfinished children of its own (independent work survives, with a
-    reconciliation comment left for its owner). Safe to re-run: a second
-    call finds nothing left to do. Returns ``{"archived": [...], "skipped":
-    {task_id: reason}}``.
+    Scoped to explicit provenance — exactly the registry rows owned by
+    ``successor_task_id`` — and release-only by design:
+
+    * keys whose task is terminal (done/archived) are released, preserving
+      the row; registry rows and events are NEVER deleted;
+    * INDEPENDENT active outcomes (different keys, different tasks) are
+      never archived or released — completing a GA4 unit must not close an
+      unrelated unfinished QuickFile card. An unfinished duplicate lane for
+      the SAME key cannot exist while the partial unique index plus the
+      non-terminal-JOIN hold ("one non-terminal unit per key"), so there is
+      nothing to archive.
+
+    Safe to re-run. Returns ``{"released": [keys...], "archived": []}``
+    (``archived`` is kept for caller compatibility and is always empty).
     """
-    from hermes_cli import kanban_db as _kb
     from hermes_cli.kanban_db_connect import write_txn
 
-    archived: list[str] = []
-    skipped: dict[str, str] = {}
+    released: list[str] = []
     # allow_nested: complete_task runs this INSIDE its completion txn so the
-    # release/archive/history-keeping lands atomically with the completion
-    # itself (all-or-nothing); standalone calls get the same semantics.
+    # release lands atomically with the completion itself (all-or-nothing);
+    # standalone calls get the same semantics.
     with write_txn(conn, allow_nested=True):
         rows = conn.execute(
-            "SELECT key, task_id FROM access_units WHERE released_at IS NULL",
+            "SELECT key FROM access_units WHERE task_id = ? AND released_at IS NULL",
+            (successor_task_id,),
         ).fetchall()
         for row in rows:
-            tid = row["task_id"]
-            if tid == successor_task_id:
-                continue  # the verified successor keeps its own key
-            status_row = conn.execute(
-                "SELECT status FROM tasks WHERE id = ?", (tid,),
-            ).fetchone()
-            if status_row is None:
-                _release(conn, row["key"], "task_missing")
-                continue
-            status = status_row["status"]
-            if status in TERMINAL_TASK_STATUSES:
-                _release(conn, row["key"], reason)
-                continue
-            open_children = conn.execute(
-                "SELECT 1 FROM task_links l JOIN tasks c ON c.id = l.child_id "
-                "WHERE l.parent_id = ? AND c.status NOT IN ('done', 'archived') LIMIT 1",
-                (tid,),
-            ).fetchone()
-            if open_children is not None:
-                skipped[tid] = "has_unfinished_children"
-                _kb.add_comment(
-                    conn, tid, author="kanban",
-                    body=f"reconcile: superseded by verified successor "
-                         f"{successor_task_id}; left open (unfinished children)",
-                )
-                continue
-            cur = conn.execute(
-                "UPDATE tasks SET status = 'archived', "
-                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
-                "WHERE id = ? AND status NOT IN ('archived', 'done')",
-                (tid,),
-            )
-            if cur.rowcount == 1:
-                _kb._append_event(
-                    conn, tid, "archived",
-                    {"reason": "superseded_by_successor", "successor": successor_task_id},
-                )
-                _release(conn, row["key"], reason)
-                archived.append(tid)
-            else:
-                skipped[tid] = f"status_{status}"
-    return {"archived": archived, "skipped": skipped}
+            _release(conn, row["key"], reason)
+            released.append(row["key"])
+    return {"released": released, "archived": []}
 
 
 def _release(conn: sqlite3.Connection, key: str, reason: str) -> None:

@@ -230,6 +230,17 @@ KANBAN_REQUEST_REVIEW_SCHEMA = _schema(
                 "Optional reviewer profile. When provided, the task is "
                 "reassigned to that profile before review dispatch."
         )),
+        "access_review_of": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 3,
+            "maxItems": 3,
+            "description": (
+                "Advanced (kanban.access_units.review_keys, default off): "
+                "[artifact_digest, rubric_digest, review_class]. A duplicate "
+                "request converges on the existing active review card."
+            ),
+        },
         "metadata": {
             "type": "object",
             "description": (
@@ -435,6 +446,30 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "that task id is returned instead of creating a duplicate "
                 "access lane."
         )),
+        "access_review_of": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 3,
+            "maxItems": 3,
+            "description": (
+                "Advanced (kanban.access_units.review_keys, default off): "
+                "[artifact_digest, rubric_digest, review_class] — one active "
+                "review per exact tuple; concurrent duplicates converge on "
+                "the committed card without orphan active cards."
+            ),
+        },
+        "access_collision_resources": {
+            "type": "array",
+            "items": {"type": "string"},
+            "maxItems": 64,
+            "description": (
+                "Advanced (kanban.access_units.narrow_pr_guards, default "
+                "off): bounded collision declarations using repo:, file:, "
+                "service:, schema:, secret:, or profile: prefixes. File "
+                "values are 'file:owner/repo:path'; disjoint files in one "
+                "repo remain independent, while repo: is intentionally broad."
+            ),
+        },
         "access_continuation_of": {
             "type": "array",
             "items": {"type": "string"},

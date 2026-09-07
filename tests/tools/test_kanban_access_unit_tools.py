@@ -75,6 +75,54 @@ def test_kanban_create_converges_on_active_outcome_unit(
     assert first["task_id"] == second["task_id"]  # converged, no second lane
 
 
+def test_kanban_create_canonicalises_model_supplied_outcome_key_variants(
+    kanban_home, dispatcher_ctx, flags,
+):
+    """Casing/padding variants cannot bypass the tool/domain uniqueness key."""
+    flags["outcome_keys"] = True
+    first = json.loads(_handle_create({
+        "title": "canonical", "assignee": "vladamir",
+        "access_outcome_key": "Ruth|GA4| Properties/5 |READ_ONLY",
+    }))
+    second = json.loads(_handle_create({
+        "title": "variant", "assignee": "ruth",
+        "access_outcome_key": " ruth | ga4 |properties/5| read_only ",
+    }))
+    assert first["task_id"] == second["task_id"]
+
+
+def test_kanban_create_persists_bounded_collision_declaration(
+    kanban_home, dispatcher_ctx, flags,
+):
+    """The model-facing create surface validates and durably records the
+    intended file/service/schema/secret/profile granularity — no direct SQL."""
+    flags["narrow_pr_guards"] = True
+    out = json.loads(_handle_create({
+        "title": "scoped work", "assignee": "nadia",
+        "access_collision_resources": [
+            "file:acme/erp:src/orders.py",
+            "service:render:api", "schema:erp:orders-v2",
+            "secret:vault:erp-api", "profile:config:nadia",
+        ],
+    }))
+    with kbc.connect_closing() as conn:
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'access_collision_resources' ORDER BY id DESC LIMIT 1",
+            (out["task_id"],),
+        ).fetchone()
+    assert event is not None
+    payload = json.loads(event["payload"])
+    assert payload == {
+        "repositories": [],
+        "files": ["acme/erp:src/orders.py"],
+        "services": ["render:api"],
+        "schemas": ["erp:orders-v2"],
+        "secrets": ["vault:erp-api"],
+        "profiles": ["config:nadia"],
+    }
+
+
 def test_kanban_create_outcome_args_inert_when_flag_off(
     kanban_home, dispatcher_ctx, flags
 ):
@@ -150,24 +198,24 @@ def test_serial_connector_starvation_regression(kanban_home, dispatcher_ctx, fla
 
 
 def test_duplicate_review_lane_regression(kanban_home, dispatcher_ctx, flags):
-    """The historical duplicate-review pattern: two watchdogs requesting a
-    review of the SAME (artifact, rubric, class) tuple converge on one review
-    card — the second gets the first's task id."""
+    """Two model-facing kanban_create calls for the SAME
+    (artifact, rubric, class) tuple converge atomically on one review card."""
     flags["review_keys"] = True
+    descriptor = ["sha256:aaa", "sha256:bbb", "independent"]
+    first = json.loads(_handle_create({
+        "title": "review 1", "assignee": "vladamir",
+        "access_review_of": descriptor,
+    }))
+    second = json.loads(_handle_create({
+        "title": "review 2 dup", "assignee": "ruth",
+        "access_review_of": descriptor,
+    }))
+    assert first["task_id"] == second["task_id"]
     with kbc.connect_closing() as conn:
-        first = kb.create_access_review_task(
-            conn,
-            artifact_digest="sha256:aaa", rubric_digest="sha256:bbb",
-            review_class="independent", assignee="vladamir", title="review 1",
-            flags=flags,
-        )
-        second = kb.create_access_review_task(
-            conn,
-            artifact_digest="sha256:aaa", rubric_digest="sha256:bbb",
-            review_class="independent", assignee="ruth", title="review 2 dup",
-            flags=flags,
-        )
-    assert first == second
+        active = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'archived')"
+        ).fetchone()[0]
+    assert active == 1
 
 
 def test_active_pr_event_storm_regression(kanban_home, dispatcher_ctx, flags):

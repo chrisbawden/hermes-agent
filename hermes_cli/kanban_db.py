@@ -1255,6 +1255,8 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     access_outcome_key: Optional[str] = None,
     access_continuation_of: Optional[tuple[str, str, str]] = None,
+    access_review_of: Optional[tuple[str, str, str]] = None,
+    access_collision_resources: Optional[Iterable[str]] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1270,9 +1272,14 @@ def create_task(
     Access units (default-off ``kanban.access_units.*`` flags):
     ``access_outcome_key`` registers the stable outcome key atomically with
     creation — a duplicate creator converges on the ACTIVE unit for the key
-    (its task id is returned, no second lane). ``access_continuation_of`` is
-    ``(outcome_key, unit_digest, predecessor_task_id)``; same convergence for
-    continuation cards. With both flags off the parameters are ignored.
+    (its task id is returned, no second lane). ``access_review_of`` is
+    ``(artifact_digest, rubric_digest, review_class)``; ``access_continuation_of``
+    is ``(outcome_key, unit_digest, predecessor_task_id)``. Both register in the
+    task-creation transaction and converge on the active unit.
+    ``access_collision_resources`` is a bounded iterable of
+    ``repo|file|service|schema|secret|profile:value`` declarations stored
+    atomically on the task for the narrow PR guard. With the owning flag off,
+    each parameter is ignored.
     """
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
@@ -1311,8 +1318,19 @@ def create_task(
     # retry with a fresh idempotency key still converges.
     from hermes_cli import kanban_access_units as _kau
     flags = _access_unit_flags()
+    collision_declaration = None
+    if access_collision_resources is not None and flags.get("narrow_pr_guards"):
+        collision_declaration = _kau.parse_collision_resources(access_collision_resources)
     if access_outcome_key and flags.get("outcome_keys"):
+        access_outcome_key = _kau.canonical_outcome_key(access_outcome_key)
         active = _kau.active_access_unit(conn, access_outcome_key)
+        if active is not None:
+            return active
+    review_key = None
+    if access_review_of is not None and flags.get("review_keys"):
+        artifact_digest, rubric_digest, review_class = access_review_of
+        review_key = _kau.build_review_key(artifact_digest, rubric_digest, review_class)
+        active = _kau.active_access_unit(conn, review_key)
         if active is not None:
             return active
     continuation_key = None
@@ -1402,6 +1420,11 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if collision_declaration is not None:
+                    _append_event(
+                        conn, task_id, "access_collision_resources",
+                        _kau.collision_resources_payload(collision_declaration),
+                    )
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
                 # Access-unit registration in the SAME txn as creation: either
@@ -1410,32 +1433,43 @@ def create_task(
                 # INSERT fail on the partial unique index — the whole create
                 # rolls back and the loser converges via the active-unit read.
                 if access_outcome_key and flags.get("outcome_keys"):
-                    conn.execute(
-                        "INSERT INTO access_units (key, unit_class, task_id, created_by, created_at) "
-                        "VALUES (?, 'outcome', ?, ?, ?)",
-                        (access_outcome_key, task_id, created_by, now),
+                    _kau.register_access_unit(
+                        conn, key=access_outcome_key, unit_class="outcome",
+                        task_id=task_id, created_by=created_by,
+                    )
+                if review_key is not None:
+                    _kau.register_access_unit(
+                        conn, key=review_key, unit_class="review",
+                        task_id=task_id, created_by=created_by,
                     )
                 if continuation_key is not None:
-                    conn.execute(
-                        "INSERT INTO access_units (key, unit_class, task_id, created_by, created_at) "
-                        "VALUES (?, 'continuation', ?, ?, ?)",
-                        (continuation_key, task_id, created_by, now),
+                    _kau.register_access_unit(
+                        conn, key=continuation_key, unit_class="continuation",
+                        task_id=task_id, created_by=created_by,
                     )
             return task_id
+        except _kau.AccessUnitConflict as conflict:
+            # The serialized write transaction observed the exact active
+            # winner. Return it directly — important when a caller registers
+            # more than one key class and only one of them conflicted.
+            return conflict.existing_task_id
         except sqlite3.IntegrityError:
-            # A lost access-unit key race surfaces here too (the partial unique
-            # index rejects the registry INSERT). One retry re-reads the active
-            # unit and converges; if the winner vanished the retry registers.
-            if access_outcome_key or continuation_key is not None:
+            # A lost access-unit key race can also surface as a partial-index
+            # violation. Re-read each enabled key and converge; if the winner
+            # vanished, the normal id-collision retry gets one more attempt.
+            if access_outcome_key or review_key is not None or continuation_key is not None:
                 try:
                     flags = _access_unit_flags()
-                    active = None
-                    if access_outcome_key and flags.get("outcome_keys"):
-                        active = _kau.active_access_unit(conn, access_outcome_key)
-                    elif continuation_key is not None and flags.get("continuation_keys"):
-                        active = _kau.active_access_unit(conn, continuation_key)
-                    if active is not None:
-                        return active
+                    keys = (
+                        (access_outcome_key, "outcome_keys"),
+                        (review_key, "review_keys"),
+                        (continuation_key, "continuation_keys"),
+                    )
+                    for key, flag in keys:
+                        if key is not None and flags.get(flag):
+                            active = _kau.active_access_unit(conn, key)
+                            if active is not None:
+                                return active
                 except Exception:
                     pass  # fall through to the normal collision handling
             if attempt == 1:
@@ -2690,21 +2724,32 @@ def complete_task(
             _completed_event_payload(result, event_summary, verified_cards, metadata),
             run_id=run_id,
         )
-        # Access-unit completion hook (default-off flags): release every
-        # registry key this task owns so a successor can register, then run
-        # the idempotent stale-card reconciliation. Registry rows and events
-        # are never deleted — only released/archived.
-        if _access_unit_flags().get("stale_reconciliation"):
+        # Access-unit completion hook (all flags default off). Registry
+        # uniqueness is "one NON-TERMINAL unit", so each enabled key class
+        # releases its owner on completion independently of the optional
+        # reconciliation flag. Rows/events are retained for audit. The
+        # reconciliation flag remains a separate, idempotent housekeeping
+        # hook, scoped by reconcile_successor to this task's own provenance.
+        flags = _access_unit_flags()
+        release_classes = {
+            unit_class for unit_class, flag in (
+                ("outcome", "outcome_keys"),
+                ("review", "review_keys"),
+                ("continuation", "continuation_keys"),
+            )
+            if flags.get(flag)
+        }
+        if release_classes or flags.get("stale_reconciliation"):
             from hermes_cli import kanban_access_units as _kau
-            released_keys = [
-                row["key"] for row in conn.execute(
-                    "SELECT key FROM access_units WHERE task_id = ? AND released_at IS NULL",
-                    (task_id,),
-                ).fetchall()
-            ]
-            for key in released_keys:
-                _kau.release_access_unit(conn, key, reason="completed")
-            if released_keys:
+            rows = conn.execute(
+                "SELECT key, unit_class FROM access_units "
+                "WHERE task_id = ? AND released_at IS NULL",
+                (task_id,),
+            ).fetchall()
+            for row in rows:
+                if row["unit_class"] in release_classes:
+                    _kau.release_access_unit(conn, row["key"], reason="completed")
+            if flags.get("stale_reconciliation"):
                 _kau.reconcile_successor(conn, task_id)
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
     # Success wipes the breaker counter (history stays on the event log).
@@ -3131,6 +3176,7 @@ def redact_review_value(value: Any) -> Any:
 def request_review(
     conn: sqlite3.Connection, task_id: str, *, summary: Optional[str] = None,
     metadata: Optional[dict] = None, reviewer: Optional[str] = None,
+    access_review_of: Optional[tuple[str, str, str]] = None,
     expected_run_id: Optional[int] = None, force: bool = False, with_reason: bool = False,
 ):
     """``running``/``ready`` -> ``review``; never touches block recurrence accounting.
@@ -3147,6 +3193,8 @@ def request_review(
 
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
+    from hermes_cli import kanban_access_units as _kau
+
     with write_txn(conn):
         # Access-unit review key (default-off ``kanban.access_units.review_keys``):
         # when the summary or metadata carries an explicit review descriptor
@@ -3155,7 +3203,13 @@ def request_review(
         # this card instead of spawning a second review lane.
         review_key = None
         if _access_unit_flags().get("review_keys"):
-            review_key = _extract_review_key(summary, metadata)
+            if access_review_of is not None:
+                artifact_digest, rubric_digest, review_class = access_review_of
+                review_key = _kau.build_review_key(
+                    artifact_digest, rubric_digest, review_class,
+                )
+            else:
+                review_key = _extract_review_key(summary, metadata)
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
@@ -3187,6 +3241,31 @@ def request_review(
                     "malformed); pass reviewer= explicitly",
                 )
         reviewer = _canonical_assignee(reviewer)
+        if review_key is not None:
+            active_review = _kau.active_access_unit(conn, review_key)
+            if active_review is not None and active_review != task_id:
+                # The tuple already has a non-terminal review card. Converge
+                # atomically: archive this duplicate before it can enter the
+                # review lane, close any owned run, and return the winner as
+                # the real landing. No orphan active card survives.
+                cur = conn.execute(
+                    "UPDATE tasks SET status='archived', claim_lock=NULL, "
+                    "claim_expires=NULL, worker_pid=NULL WHERE id=? "
+                    "AND status IN ('running', 'ready')",
+                    (task_id,),
+                )
+                if cur.rowcount != 1:
+                    return _ret(False, "task changed during review convergence")
+                run_id = _end_or_synthesize_run(
+                    conn, task_id, outcome="review_converged", status="archived",
+                    summary=summary, metadata=metadata, synthesize=True,
+                )
+                _append_event(
+                    conn, task_id, "archived",
+                    {"reason": "duplicate_review_converged", "existing": active_review},
+                    run_id=run_id,
+                )
+                return _ret(True, active_review)
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
         params: tuple[Any, ...] = (
@@ -3211,13 +3290,12 @@ def request_review(
                 False, "task is not in running/ready (or expected_run_id did not match the current run)",
             )
         # Register the review key inside the same txn as the review
-        # transition: either both land or neither does.
+        # transition: either both land or neither does. Same-task re-review is
+        # idempotent; a concurrent other-task winner is caught by the registry.
         if review_key is not None:
-            from hermes_cli import kanban_access_units as _kau
-            conn.execute(
-                "INSERT INTO access_units (key, unit_class, task_id, created_by, created_at) "
-                "VALUES (?, 'review', ?, ?, ?)",
-                (review_key, task_id, implementer, int(time.time())),
+            _kau.register_access_unit(
+                conn, key=review_key, unit_class="review", task_id=task_id,
+                created_by=implementer,
             )
         run_id = _end_or_synthesize_run(
             conn, task_id, outcome="review_requested", status="review",
@@ -3234,7 +3312,7 @@ def request_review(
             },
             run_id=run_id,
         )
-    return _ret(True)
+    return _ret(True, task_id)
 
 
 def _prior_reviewer(conn: sqlite3.Connection, task_id: str):
@@ -3302,35 +3380,16 @@ def create_access_review_task(
     review lane. With ``review_keys`` disabled this is a plain create_task
     (legacy behaviour, duplicates possible as before).
     """
-    from hermes_cli import kanban_access_units as _kau
-
     active_flags = flags if flags is not None else _access_unit_flags()
     if not active_flags.get("review_keys"):
         return create_task(conn, title=title, body=body, assignee=assignee)
-    key = _kau.build_review_key(artifact_digest, rubric_digest, review_class)
-    active = _kau.active_access_unit(conn, key)
-    if active is not None:
-        return active
-    task_id = create_task(conn, title=title, body=body, assignee=assignee)
-    try:
-        _kau.register_access_unit(
-            conn, key=key, unit_class="review", task_id=task_id,
-            created_by=_nonblank_str(assignee),
-        )
-    except _kau.AccessUnitConflict as conflict:
-        # Lost the race: the winner's card is the review; the just-created
-        # duplicate card is archived immediately (it has no history yet).
-        with write_txn(conn):
-            conn.execute(
-                "UPDATE tasks SET status = 'archived' WHERE id = ? AND status NOT IN "
-                "('archived', 'done')", (task_id,),
-            )
-            _append_event(
-                conn, task_id, "archived",
-                {"reason": "duplicate_review_converged", "existing": conflict.existing_task_id},
-            )
-        return conflict.existing_task_id
-    return task_id
+    # Real atomic creation path: review provenance is registered in the SAME
+    # transaction as task creation. No loser card ever commits, so concurrent
+    # callers converge without creating an orphan to archive afterwards.
+    return create_task(
+        conn, title=title, body=body, assignee=assignee,
+        access_review_of=(artifact_digest, rubric_digest, review_class),
+    )
 
 
 def request_changes(

@@ -141,6 +141,24 @@ def test_release_allows_successor_and_preserves_history(conn):
     assert rows[1]["released_at"] is None
 
 
+def test_missing_owner_does_not_block_successor_and_registry_history_survives(conn):
+    key = kau.build_outcome_key("ruth", "ga4", "properties/2", "read_only")
+    owner = kb.create_task(conn, title="deleted owner", assignee="vladamir")
+    kau.register_access_unit(conn, key=key, unit_class="outcome", task_id=owner)
+    assert kb.delete_task(conn, owner) is True
+
+    successor = kb.create_task(conn, title="successor", assignee="vladamir")
+    kau.register_access_unit(conn, key=key, unit_class="outcome", task_id=successor)
+    assert kau.active_access_unit(conn, key) == successor
+    rows = conn.execute(
+        "SELECT task_id, released_at FROM access_units WHERE key = ? ORDER BY created_at",
+        (key,),
+    ).fetchall()
+    assert len(rows) == 2
+    assert rows[0]["task_id"] == owner and rows[0]["released_at"] is not None
+    assert rows[1]["task_id"] == successor and rows[1]["released_at"] is None
+
+
 def test_concurrent_registration_yields_exactly_one_winner(kanban_home: Path):
     """N processes race to register N distinct tasks under one key: exactly
     one task ends up active and every loser observes the same winner. Each
@@ -202,6 +220,16 @@ def test_review_key_atomicity(conn):
 # Continuation key: one active continuation
 # ---------------------------------------------------------------------------
 
+def test_continuation_key_canonicalises_embedded_outcome_key():
+    first = kau.build_continuation_key(
+        " Ruth | GA4 | properties/1 | READ_ONLY ", "sha256:unit", "t_abc",
+    )
+    second = kau.build_continuation_key(
+        "ruth|ga4|properties/1|read_only", "sha256:unit", "t_abc",
+    )
+    assert first == second
+
+
 def test_continuation_key_atomicity(conn):
     ok = kau.build_outcome_key("sophie", "klaviyo", "list/9", "read_only")
     pred = kb.create_task(conn, title="predecessor", assignee="sophie")
@@ -262,17 +290,20 @@ def test_pr_guard_resource_spec_parsing():
     assert spec.profiles == {"config:ruth"}
 
 
-def test_pr_guard_overlap_detection():
-    a = kau.parse_collision_resources([
-        "repo:acme/erp", "file:acme/erp:src/login.py",
-    ])
+def test_pr_guard_overlap_detection_respects_declared_granularity():
+    files = kau.parse_collision_resources(["file:acme/erp:src/login.py"])
     same_file = kau.parse_collision_resources(["file:acme/erp:src/login.py"])
     other_file_same_repo = kau.parse_collision_resources(["file:acme/erp:src/other.py"])
+    repo_wide = kau.parse_collision_resources(["repo:acme/erp"])
     unrelated = kau.parse_collision_resources(["file:other/repo:src/login.py"])
 
-    assert kau.resources_overlap(a, same_file) is True
-    assert kau.resources_overlap(a, other_file_same_repo) is True   # repo match
-    assert kau.resources_overlap(a, unrelated) is False             # fully unrelated
+    assert kau.resources_overlap(files, same_file) is True
+    assert kau.resources_overlap(files, other_file_same_repo) is False
+    # An explicit repo declaration is intentionally broad and overlaps every
+    # file declared in that repository, whichever side declares it.
+    assert kau.resources_overlap(files, repo_wide) is True
+    assert kau.resources_overlap(repo_wide, files) is True
+    assert kau.resources_overlap(files, unrelated) is False
 
 
 def test_pr_guard_one_durable_wait_event(conn):
@@ -301,63 +332,58 @@ def test_pr_guard_one_durable_wait_event(conn):
 # Stale-card reconciliation after verified successor
 # ---------------------------------------------------------------------------
 
-def test_reconcile_archives_superseded_and_preserves_history(conn):
-    key = kau.build_outcome_key("ruth", "ga4", "properties/9", "read_only")
-    original = kb.create_task(conn, title="original unit", assignee="vladamir")
-    kau.register_access_unit(conn, key=key, unit_class="outcome", task_id=original)
-    kb.add_comment(conn, original, author="vladamir", body="original attempt")
-
+def test_reconcile_releases_only_verified_units_own_key_and_preserves_history(conn):
+    own_key = kau.build_outcome_key("ruth", "ga4", "properties/9", "read_only")
     successor = kb.create_task(conn, title="verified successor", assignee="vladamir")
-    # Successor verified: original completed.
-    assert kb.complete_task(conn, original, summary="superseded route, verified")
+    kau.register_access_unit(conn, key=own_key, unit_class="outcome", task_id=successor)
+    kb.add_comment(conn, successor, author="vladamir", body="verified attempt")
 
-    result = kau.reconcile_successor(conn, successor)
-    assert result["archived"] == []  # original already terminal; key released only
-    assert kau.active_access_unit(conn, key) is None
+    unrelated_key = kau.build_outcome_key("ruth", "quickfile", "reports", "read_only")
+    unrelated = kb.create_task(conn, title="independent unit", assignee="ruth")
+    kau.register_access_unit(conn, key=unrelated_key, unit_class="outcome", task_id=unrelated)
 
-    # A stale non-terminal duplicate lane DOES get archived (with history kept).
-    stale = kb.create_task(conn, title="stale duplicate lane", assignee="ruth")
     with kb.write_txn(conn):
-        conn.execute("INSERT INTO access_units (key, unit_class, task_id, created_by, created_at) "
-                     "VALUES (?, 'outcome', ?, 'test', 0)",
-                     (kau.build_outcome_key("ruth", "ga4", "properties/9", "read_only") + "-x", stale))
-    # Register it properly through the API under the SAME key requires release
-    # first; instead simulate a second outcome key whose task is unfinished.
-    result2 = kau.reconcile_successor(conn, successor)
-    assert stale in result2["archived"]
-    events = conn.execute(
-        "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'archived'", (stale,),
-    ).fetchone()[0]
-    assert events == 1  # history preserved — the archive event survives
-    assert kb.list_comments(conn, original)  # original's comments untouched
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (successor,))
+    result = kau.reconcile_successor(conn, successor)
+    assert result == {"released": [own_key], "archived": []}
+    assert kau.active_access_unit(conn, own_key) is None
+    assert kau.active_access_unit(conn, unrelated_key) == unrelated
+    unrelated_task = kb.get_task(conn, unrelated)
+    assert unrelated_task is not None and unrelated_task.status != "archived"
+    assert kb.list_comments(conn, successor)  # history untouched
 
 
 def test_reconcile_is_idempotent(conn):
     key = kau.build_outcome_key("ruth", "ga4", "properties/9", "read_only")
-    original = kb.create_task(conn, title="original", assignee="vladamir")
-    kau.register_access_unit(conn, key=key, unit_class="outcome", task_id=original)
     successor = kb.create_task(conn, title="successor", assignee="vladamir")
-    kb.complete_task(conn, original, summary="done")
+    kau.register_access_unit(conn, key=key, unit_class="outcome", task_id=successor)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (successor,))
+
     first = kau.reconcile_successor(conn, successor)
     second = kau.reconcile_successor(conn, successor)
-    assert first["archived"] == [] and second["archived"] == []
-    # Registry rows preserved (append-only), none active.
-    rows = conn.execute("SELECT COUNT(*) FROM access_units WHERE key = ?", (key,)).fetchone()[0]
-    assert rows >= 1
+    assert first == {"released": [key], "archived": []}
+    assert second == {"released": [], "archived": []}
+    # Registry row preserved (append-only), now released.
+    row = conn.execute(
+        "SELECT released_at FROM access_units WHERE key = ?", (key,)).fetchone()
+    assert row["released_at"] is not None
 
 
 def test_reconcile_never_closes_independent_unfinished_work(conn):
     key = kau.build_outcome_key("ruth", "ga4", "properties/9", "read_only")
-    dup = kb.create_task(conn, title="dup with live children", assignee="ruth")
-    kau.register_access_unit(conn, key=key, unit_class="outcome", task_id=dup)
-    child = kb.create_task(conn, title="independent child", assignee="nadia", parents=[dup])
+    independent = kb.create_task(conn, title="independent with child", assignee="ruth")
+    kau.register_access_unit(conn, key=key, unit_class="outcome", task_id=independent)
+    child = kb.create_task(conn, title="independent child", assignee="nadia", parents=[independent])
     successor = kb.create_task(conn, title="verified successor", assignee="vladamir")
 
     result = kau.reconcile_successor(conn, successor)
-    assert dup in result["skipped"]
-    assert result["skipped"][dup] == "has_unfinished_children"
-    assert kb.get_task(conn, dup).status != "archived"
-    assert kb.get_task(conn, child).status == "todo"  # untouched
+    assert result == {"released": [], "archived": []}
+    assert kau.active_access_unit(conn, key) == independent
+    independent_task = kb.get_task(conn, independent)
+    assert independent_task is not None and independent_task.status != "archived"
+    child_task = kb.get_task(conn, child)
+    assert child_task is not None and child_task.status == "todo"  # untouched
 
 
 # ---------------------------------------------------------------------------
